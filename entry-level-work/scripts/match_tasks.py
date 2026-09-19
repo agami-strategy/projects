@@ -185,6 +185,9 @@ def main() -> None:
     ap.add_argument("--effort", default="medium", choices=["low", "medium", "high", "xhigh", "max"])
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--fresh", action="store_true")
+    ap.add_argument("--min-per-level", type=int, default=5,
+                    help="only match ads in OSCA unit groups with at least this many entry_level AND experienced ads")
+    ap.add_argument("--min-confidence", type=float, default=0.0, help="skip ads whose OSCA top-1 confidence is below this")
     args = ap.parse_args()
 
     model = MODELS[args.model]
@@ -200,14 +203,28 @@ def main() -> None:
     ads = [json.loads(l) for l in open(args.input, encoding="utf-8")]
     if args.limit:
         ads = ads[: args.limit]
+    # unit groups that have enough ads at both levels (counted over all labelled ads in the merged file)
+    level_counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for row in merged.values():
+        if row["osca_code"] and row["level"] in ("entry_level", "experienced"):
+            if row["osca_confidence"] in ("", None) or float(row["osca_confidence"]) >= args.min_confidence:
+                level_counts[row["osca_code"]][row["level"]] += 1
+    eligible = {c for c, d in level_counts.items() if d["entry_level"] >= args.min_per_level and d["experienced"] >= args.min_per_level}
+
     work_items, skipped = [], defaultdict(int)
     for ad in ads:
         row = merged.get(ad["id"])
         if not row or not row["osca_code"]:
             skipped["no OSCA code"] += 1
             continue
-        if not row["level"]:
-            skipped["no seniority label"] += 1
+        if row["level"] not in ("entry_level", "experienced"):
+            skipped["no usable seniority label"] += 1
+            continue
+        if row["osca_confidence"] not in ("", None) and float(row["osca_confidence"]) < args.min_confidence:
+            skipped["low OSCA confidence"] += 1
+            continue
+        if row["osca_code"] not in eligible:
+            skipped[f"unit group has < {args.min_per_level} ads at one level"] += 1
             continue
         tasks = tasks_by_code.get(row["osca_code"])
         if not tasks:
