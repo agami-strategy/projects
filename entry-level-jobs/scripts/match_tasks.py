@@ -121,21 +121,37 @@ def summarise(ad_row: dict, tasks: list[dict], result: dict | None) -> tuple[lis
     task_rows, acc = [], defaultdict(float)
     for t in tasks:
         jj = j.get(t["task_id"], {"judgement": "missing", "evidence": ""})
+        ts = t["time_share"]
+        # "largely X": X accounts for at least half of the task's time
+        largely = {"auto": int(t["automation_time"] / ts >= 0.5) if ts else 0,
+                   "aug": int(t["augmentation_time"] / ts >= 0.5) if ts else 0,
+                   "unaff": int(t["unaffected_time"] / ts >= 0.5) if ts else 0}
         task_rows.append([ad_row["id"], ad_row["title"], ad_row["level"], ad_row["osca_code"], ad_row["osca_title"],
                           t["task_id"], t["task"], jj["judgement"], jj["evidence"],
-                          t["time_share"], t["automation_time"], t["augmentation_time"], t["unaffected_time"],
-                          t["gpt4_exposure"], t["gpt4_automation"]])
+                          ts, t["automation_time"], t["augmentation_time"], t["unaffected_time"],
+                          t["gpt4_exposure"], t["gpt4_automation"],
+                          largely["auto"], largely["aug"], largely["unaff"]])
         k = jj["judgement"]
         acc[f"n_{k}"] += 1
-        acc[f"time_{k}"] += t["time_share"]
+        acc[f"time_{k}"] += ts
         acc[f"auto_{k}"] += t["automation_time"]
         acc[f"aug_{k}"] += t["augmentation_time"]
+        for cat, flag in largely.items():
+            acc[f"largely_{cat}_{k}"] += flag
     time_ex, time_exim = acc["time_explicit"], acc["time_explicit"] + acc["time_implied"]
     auto_ex, auto_exim = acc["auto_explicit"], acc["auto_explicit"] + acc["auto_implied"]
     aug_ex, aug_exim = acc["aug_explicit"], acc["aug_explicit"] + acc["aug_implied"]
     occ_time = sum(t["time_share"] for t in tasks)
     occ_auto = sum(t["automation_time"] for t in tasks)
     occ_aug = sum(t["augmentation_time"] for t in tasks)
+    n_ex = acc["n_explicit"]
+    n_exim = acc["n_explicit"] + acc["n_implied"]
+    def count_share(cat: str, explicit_only: bool):
+        n = n_ex if explicit_only else n_exim
+        if not n:
+            return None
+        s = acc[f"largely_{cat}_explicit"] + (0 if explicit_only else acc[f"largely_{cat}_implied"])
+        return round(s / n, 4)
     summary = [
         ad_row["id"], ad_row["title"], ad_row["company"], ad_row["level"], ad_row["level_source"],
         ad_row["osca_code"], ad_row["osca_title"], ad_row["osca_source"],
@@ -147,18 +163,24 @@ def summarise(ad_row: dict, tasks: list[dict], result: dict | None) -> tuple[lis
         round(aug_ex / time_ex, 4) if time_ex else None,
         round(aug_exim / time_exim, 4) if time_exim else None,
         round(occ_aug / occ_time, 4) if occ_time else None,
+        # count-based shares: fraction of matched tasks that are largely automatable / augmentable / unaffected
+        count_share("auto", False), count_share("aug", False), count_share("unaff", False),
+        count_share("auto", True), count_share("aug", True), count_share("unaff", True),
         (result or {}).get("error"),
     ]
     return task_rows, summary
 
 
 TASK_HEADER = ["ad_id", "ad_title", "level", "osca_code", "osca_title", "task_id", "task", "judgement", "evidence",
-               "time_share", "automation_time", "augmentation_time", "unaffected_time", "gpt4_exposure", "gpt4_automation"]
+               "time_share", "automation_time", "augmentation_time", "unaffected_time", "gpt4_exposure", "gpt4_automation",
+               "largely_automatable", "largely_augmentable", "largely_unaffected"]
 SUMMARY_HEADER = ["ad_id", "ad_title", "company", "level", "level_source", "osca_code", "osca_title", "osca_source",
                   "n_tasks", "n_explicit", "n_implied", "n_not_required", "n_missing",
                   "time_share_explicit", "time_share_explicit_or_implied",
                   "automation_share_explicit", "automation_share_explicit_or_implied", "automation_share_occupation",
                   "augmentation_share_explicit", "augmentation_share_explicit_or_implied", "augmentation_share_occupation",
+                  "automation_count_share", "augmentation_count_share", "unaffected_count_share",
+                  "automation_count_share_explicit", "augmentation_count_share_explicit", "unaffected_count_share_explicit",
                   "error"]
 
 

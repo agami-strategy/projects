@@ -249,6 +249,7 @@ def main() -> None:
     ap.add_argument("--thinking", action="store_true", help="enable DeepSeek thinking mode (slower, more output tokens)")
     ap.add_argument("--dry-run", action="store_true", help="build prompts and report sizes; no API calls")
     ap.add_argument("--fresh", action="store_true", help="discard existing output for this input+model and relabel everything")
+    ap.add_argument("--review-only", action="store_true", help="rebuild the review workbook from the existing JSONL; no API calls")
     args = ap.parse_args()
 
     groups = load_osca(Path(args.osca))
@@ -286,6 +287,11 @@ def main() -> None:
                 results[r["id"]] = r
         print(f"resuming: {len(results)} already labelled")
     todo = [a for a in ads if a["id"] not in results]
+
+    if args.review_only:
+        write_review_xlsx(ads, results, groups, xlsx_path)
+        print(f"wrote {xlsx_path} from {len(results)} existing labels ({len(todo)} ads unlabelled)")
+        return
 
     lock = threading.Lock()
     out = open(jsonl_path, "a", encoding="utf-8")
