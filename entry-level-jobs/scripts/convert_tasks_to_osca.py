@@ -27,6 +27,11 @@ Usage
 
 Output  data/osca_task_share.xlsx (sheets: tasks, summary, mapping, unmapped) and osca_task_share.csv
 """
+# %% Imports and file paths
+# This is the data-preparation step that produces data/osca_task_share.csv, the task file every
+# downstream script (match_tasks, regress_*, task_prevalence) reads. The task/time-share data exist
+# only for ANZSCO v1.3 unit groups, while the job ads are coded to OSCA 2024, so a crosswalk is needed.
+# Everything is done with openpyxl and plain dicts; no pandas.
 from __future__ import annotations
 
 import argparse
@@ -37,6 +42,8 @@ from pathlib import Path
 
 import openpyxl
 
+# label_osca supplies: DEFAULT_OSCA (path to the OSCA descriptions workbook), load_osca (code -> title,
+# skill level) and load_workbook_safely (openpyxl loader that tolerates the ABS files' quirks).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from label_osca import DEFAULT_OSCA, load_osca, load_workbook_safely  # noqa: E402
 
@@ -46,12 +53,24 @@ CORR_FILE = ROOT / "data" / "osca_correspondence_tables.xlsx"
 OUT_XLSX = ROOT / "data" / "osca_task_share.xlsx"
 OUT_CSV = ROOT / "data" / "osca_task_share.csv"
 
+# %% Column conventions of the source task workbook
+# TIME_COLS are the four per-task time quantities that get rescaled by the crosswalk weight and summed
+# across sources. Note "augmetnation_time" is the source workbook's own misspelled column name; it is
+# read verbatim and renamed to augmentation_time only in the output header below.
+# NUMERIC_TASK_COLS are model predictions (continuous) that are averaged across sources, weighted by
+# time share. LABEL_TASK_COLS are categorical/dummy task attributes copied from the first source seen,
+# on the assumption that a given Task ID carries the same labels wherever it appears.
 CORR_SHEET = "Table 1"  # ANZSCO v1.3 -> OSCA 2024 v1.0 (the task file uses v1.3 unit groups)
 TIME_COLS = ["TOTAL_TIME_SHARE", "augmetnation_time", "automation_time", "unaffected_time"]
 NUMERIC_TASK_COLS = ["aug_pred", "ai_pred"]
 LABEL_TASK_COLS = ["gpt4_exposure", "gpt4_automation", "ai_dummy", "aug_dummy"]
 
 
+# %% Load the ANZSCO task rows
+# Reads the first worksheet; the first row is the header. A blank in column B (index 1) marks an
+# empty/trailing row and is skipped. Codes are stringified and stripped so that a numeric cell
+# (e.g. 2211 stored as int) and a text cell ("2211") both key the same group.
+# Returns titles {anzsco_ug: title} and tasks {anzsco_ug: [row dict keyed by header]}.
 def load_tasks(path: Path) -> tuple[dict[str, str], dict[str, list[dict]]]:
     """Return ({anzsco_ug: title}, {anzsco_ug: [row dicts]})."""
     ws = load_workbook_safely(path).worksheets[0]
@@ -69,6 +88,13 @@ def load_tasks(path: Path) -> tuple[dict[str, str], dict[str, list[dict]]]:
     return titles, tasks
 
 
+# %% Load the ABS correspondence (6-digit occupation links)
+# Layout of "Table 1" in the ABS workbook: five title/header rows (skipped by [5:]), then one row per
+# link with column A = ANZSCO v1.3 6-digit code, column C = OSCA 6-digit code, column D = "p" for a
+# partial match. When one ANZSCO occupation maps to several OSCA occupations the ANZSCO code is shown
+# once and left blank on the following rows (visually merged cells), hence `src` carries forward.
+# Rows whose column C is not all digits (notes, blank lines) are ignored.
+# Output: a flat list of (anzsco6, osca6, is_partial) tuples; the 4-digit unit group is derived later.
 def load_correspondence(path: Path, sheet: str) -> list[tuple[str, str, bool]]:
     """Return [(anzsco6, osca6, is_partial)]. Blank source cells continue the previous source."""
     ws = load_workbook_safely(path)[sheet]
@@ -81,12 +107,24 @@ def load_correspondence(path: Path, sheet: str) -> list[tuple[str, str, bool]]:
     return out
 
 
+# %% Crosswalk weights from link counts
+# The core modelling choice. The ABS correspondence has no employment or proportion data, so the only
+# information about "how much" of ANZSCO group A belongs in OSCA group G is the number of 6-digit
+# occupations linking A to G. The weight of A in G is
+#     score(A, G) / sum over sources A' with task data of score(A', G)
+# where score counts full links as 1 and partial links as --partial-weight. Example: if G is fed by
+# A (3 links) and B (1 link), A gets 0.75 and B 0.25. If B has no task data, A gets 1.0 and B is kept
+# with weight 0 so the gap is visible in the mapping sheet. Codes are cut to 4 digits ([:4]) because
+# both classifications use the first four digits as the unit group.
+# What would change: with employment weights (if they existed) large occupations would dominate merges;
+# with --partial-weight 0.5 partial links count half, shifting weight towards full matches.
 def build_weights(links: list[tuple[str, str, bool]], partial_weight: float, has_tasks: set[str]) -> dict[str, dict[str, dict]]:
     """{osca_ug: {anzsco_ug: {links, partial, weight}}} with weights summing to 1 per OSCA unit group.
 
     Weights are normalised over source ANZSCO groups that have task data; a source without tasks
     is kept in the table with weight 0 so the gap is visible in the mapping sheet.
     """
+    # raw[osca4][anzsco4] accumulates link counts; the nested defaultdict creates cells on first access
     raw: dict[str, dict[str, dict]] = defaultdict(lambda: defaultdict(lambda: {"links": 0, "partial": 0, "score": 0.0}))
     for a6, o6, partial in links:
         cell = raw[o6[:4]][a6[:4]]
@@ -95,6 +133,7 @@ def build_weights(links: list[tuple[str, str, bool]], partial_weight: float, has
         cell["score"] += partial_weight if partial else 1.0
     weights: dict[str, dict[str, dict]] = {}
     for og, srcs in raw.items():
+        # denominator restricted to sources that actually have task rows, so weights over those sum to 1
         total = sum(c["score"] for ag, c in srcs.items() if ag in has_tasks)
         weights[og] = {ag: {"links": c["links"], "partial": c["partial"],
                             "weight": c["score"] / total if (total and ag in has_tasks) else 0.0}
@@ -102,6 +141,15 @@ def build_weights(links: list[tuple[str, str, bool]], partial_weight: float, has
     return weights
 
 
+# %% Apply the weights: build each OSCA group's task list
+# For each OSCA group, copy every task row of every weighted source, scaling the four time columns by
+# the source's weight, and merge rows that share a Task ID by summing. Because each ANZSCO group's
+# TOTAL_TIME_SHARE sums to 1 and the weights sum to 1, the OSCA group's shares sum to 1 as well
+# (checked by the assertion in main). The three components stay consistent with the total because
+# they are scaled by the same factor.
+# Predictions (aug_pred, ai_pred) are combined as a time-share-weighted mean: accumulate pred * share
+# in _pred_acc, then divide by the merged share. For a task that appears in only one source this is
+# just the original prediction. Label columns are taken from the first source that contributes the task.
 def convert(tasks: dict[str, list[dict]], weights: dict[str, dict[str, dict]]) -> dict[str, list[dict]]:
     """Return {osca_ug: [task rows with rescaled time shares]}."""
     out: dict[str, list[dict]] = {}
@@ -112,6 +160,7 @@ def convert(tasks: dict[str, list[dict]], weights: dict[str, dict[str, dict]]) -
                 continue
             for t in tasks[ag]:
                 tid = str(t["Task ID"])
+                # this source's contribution to the task's OSCA time share
                 share = float(t["TOTAL_TIME_SHARE"]) * w["weight"]
                 if tid not in merged:
                     merged[tid] = {
@@ -134,14 +183,20 @@ def convert(tasks: dict[str, list[dict]], weights: dict[str, dict[str, dict]]) -
             for c in NUMERIC_TASK_COLS:  # share-weighted mean of predictions across source groups
                 m[c] = m["_pred_acc"][c] / share if share else None
             del m["_pred_acc"]
+            # provenance: which ANZSCO groups contributed this task, as a ";"-separated string
             m["source_anzsco"] = ";".join(sorted(set(m["source_anzsco"])))
             rows.append(m)
+        # largest time share first, so the most time-consuming tasks head each group's list
         rows.sort(key=lambda m: -m["TOTAL_TIME_SHARE"])
         out[og] = rows
     return out
 
 
+# %% Command-line entry point
 def main() -> None:
+    # %% Arguments and inputs
+    # All three input paths default to the data/ files listed in the module docstring. --partial-weight
+    # is the only tuning knob; the default 1.0 treats partial and full links alike.
     ap = argparse.ArgumentParser()
     ap.add_argument("--tasks", default=str(TASK_FILE))
     ap.add_argument("--correspondence", default=str(CORR_FILE))
@@ -150,12 +205,21 @@ def main() -> None:
                     help="weight of a partial ('p') occupation link relative to a full one (default 1.0)")
     args = ap.parse_args()
 
+    # set(tasks) is the set of ANZSCO groups that have task data, used to normalise the weights
     anzsco_titles, tasks = load_tasks(Path(args.tasks))
     links = load_correspondence(Path(args.correspondence), CORR_SHEET)
     groups = load_osca(Path(args.osca))
     weights = build_weights(links, args.partial_weight, set(tasks))
     converted = convert(tasks, weights)
 
+    # %% Diagnostics: mapping type, gaps, and the sum-to-one check
+    # mapping_type per OSCA group: n_src counts contributing sources (with tasks); split is true if any
+    # source also feeds another OSCA group. "1:1" reproduces an ANZSCO row exactly; "split" copies a
+    # full task list into several OSCA groups; "merge" blends several lists; "merge+split" both.
+    # osca_no_tasks: OSCA groups in the descriptions file that end up with no task rows (no correspondence
+    # or only sources without tasks). anzsco_unmapped: task groups the correspondence never mentions.
+    # The assertion is the invariant the method promises: time shares sum to 1 in every populated group.
+    # It fails if a source ANZSCO group's shares do not sum to 1 in the input workbook.
     # provenance / diagnostics
     mapping_type = {}
     for og, srcs in weights.items():
@@ -169,6 +233,10 @@ def main() -> None:
         if rows and abs(s - 1) > 1e-6:
             raise AssertionError(f"time shares in OSCA {og} sum to {s}")
 
+    # %% Assemble output rows
+    # tasks sheet / CSV: one row per OSCA group x task. The header renames TOTAL_TIME_SHARE to TIME_SHARE
+    # and the misspelled source column to augmentation_time; downstream scripts read these names.
+    # Groups missing from the descriptions file get title "?" rather than failing.
     # ---- write
     task_header = ["OSCA_UNIT_CODE", "OSCA_TITLE", "Task ID", "Task", *LABEL_TASK_COLS, *NUMERIC_TASK_COLS,
                    "TIME_SHARE", "augmentation_time", "automation_time", "unaffected_time", "source_anzsco"]
@@ -180,6 +248,9 @@ def main() -> None:
                               r["TOTAL_TIME_SHARE"], r["augmetnation_time"], r["automation_time"], r["unaffected_time"],
                               r["source_anzsco"]])
 
+    # summary sheet: one row per OSCA group (including those with no tasks), with the mapping type, the
+    # sources and their weights as text, and the group's total augmentation / automation / unaffected time
+    # (these three sum to 1 for a populated group and are the occupation-level exposure baseline).
     summary_header = ["OSCA_UNIT_CODE", "OSCA_TITLE", "skill_level", "mapping_type", "n_tasks", "n_source_anzsco",
                       "source_anzsco_weights", "augmentation_time", "automation_time", "unaffected_time"]
     summary_rows = []
@@ -195,10 +266,17 @@ def main() -> None:
             sum(r["unaffected_time"] for r in rows) if rows else None,
         ])
 
+    # mapping sheet: one row per (OSCA group, ANZSCO source) pair with link counts and the weight, so a
+    # reviewer can audit every crosswalk decision; anzsco_has_tasks shows zero-weight sources
     mapping_rows = [[og, groups.get(og, {}).get("title", "?"), ag, anzsco_titles.get(ag, "(no tasks)"),
                      w["links"], w["partial"], round(w["weight"], 4), ag in tasks]
                     for og, srcs in sorted(weights.items()) for ag, w in sorted(srcs.items())]
 
+    # %% Write the workbook and the CSV
+    # openpyxl: ws.append writes one row at a time; freeze_panes "C2" keeps the header row and the first
+    # two columns (code, title) visible while scrolling; auto_filter.ref = ws.dimensions puts filter
+    # dropdowns on the whole used range. The CSV duplicates the tasks sheet for scripts that read CSV;
+    # utf-8-sig writes a BOM so Excel detects the encoding, newline="" prevents blank lines on Windows.
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "tasks"
@@ -229,6 +307,8 @@ def main() -> None:
         w.writerow(task_header)
         w.writerows(task_rows)
 
+    # %% Console summary
+    # Row counts to sanity-check: OSCA task rows exceed ANZSCO rows when splits outnumber merges.
     print(f"ANZSCO unit groups with tasks: {len(tasks)} | correspondence links: {len(links)} "
           f"({sum(1 for l in links if l[2])} partial) | OSCA unit groups: {len(groups)}")
     print(f"OSCA unit groups with task data: {sum(1 for og in converted if converted[og])} | mapping types: {dict(Counter(mapping_type.values()))}")

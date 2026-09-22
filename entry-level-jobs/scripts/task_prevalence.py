@@ -7,6 +7,10 @@ Usage:
 
 Output: data/task_prevalence_<tag>_<model>.csv and .xlsx (one row per occupation x task)
 """
+# %% Imports and paths
+# Descriptive companion to the regressions: instead of collapsing each ad to a share, it asks, task by
+# task, how often entry-level and experienced ads within the same occupation require it. This is the
+# table to consult when a regression effect needs to be traced back to specific tasks.
 from __future__ import annotations
 
 import argparse
@@ -21,22 +25,33 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from llm import DEFAULT_MODEL  # noqa: E402
 
+# Inputs: match_summary / match_labels from match_tasks.py in data/labels/, and the OSCA task list
+# (one row per occupation x task with time shares and exposure attributes) in data/.
 ROOT = Path(__file__).resolve().parents[1]
 LABEL_DIR = ROOT / "data" / "labels"
 TASK_FILE = ROOT / "data" / "osca_task_share.csv"
 LEVELS = ("entry_level", "experienced")
 
 
+# %% Command-line entry point
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tag", default="us_2026-09-17_selected_tasks")
     ap.add_argument("--model", default=DEFAULT_MODEL)
     args = ap.parse_args()
 
+    # %% Ads: occupation and level for each usable ad
+    # Same sample rule as build_ad_table in regress_automation.py: no matching error, and level is one
+    # of the two compared. ad_info maps ad_id -> (osca_code, level); osca_code is read as a string so
+    # codes keep their exact form for joining to the task file.
     summ = pd.read_csv(LABEL_DIR / f"match_summary_{args.tag}_{args.model}.csv", encoding="utf-8-sig", dtype={"osca_code": str})
     summ = summ[summ["error"].isna() & summ["level"].isin(LEVELS)]
     ad_info = {r.ad_id: (r.osca_code, r.level) for r in summ.itertuples()}
 
+    # %% Task attributes keyed by (occupation, task id)
+    # Fractions are each component's share of the task's own time (automation + augmentation +
+    # unaffected = 1 per task); None when the task has zero time share. gpt4_exposure / gpt4_automation
+    # are the task-level labels carried through from the ANZSCO source workbook, kept as text.
     tasks = {}
     with open(TASK_FILE, encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
@@ -49,6 +64,11 @@ def main() -> None:
                 "gpt4_exposure": r["gpt4_exposure"], "gpt4_automation": r["gpt4_automation"],
             }
 
+    # %% Count ads and task requirements
+    # n_ads[(code, level)] is the denominator: every usable ad with a judgements record counts, whether
+    # or not any task was matched. req[(code, task)] holds four counters keyed "<level>_required" (explicit
+    # or implied) and "<level>_explicit" (explicit only). Task ids in an ad's judgements that are not in
+    # the task file are counted here but never emitted, because the output loop iterates over `tasks`.
     n_ads = defaultdict(int)                                   # (code, level) -> ads
     req = defaultdict(lambda: defaultdict(int))                # (code, task) -> {level_required, level_explicit}
     for line in open(LABEL_DIR / f"match_labels_{args.tag}_{args.model}.jsonl", encoding="utf-8"):
@@ -63,6 +83,12 @@ def main() -> None:
                 if j["judgement"] == "explicit":
                     req[(code, tid)][f"{level}_explicit"] += 1
 
+    # %% One output row per occupation x task
+    # Occupations with no ads at either level are skipped. Shares are None (blank in the CSV) when an
+    # occupation has no ads at that level, and the entry-minus-experienced difference is only computed
+    # when both shares exist. Tasks that no ad required still appear with a share of 0, which is
+    # informative (the occupation's task list includes work that ads never mention).
+    # largely_* flags use the same >= 50% rule as the regression outcomes so the two tables agree.
     rows = []
     for (code, tid), t in tasks.items():
         ne, nx = n_ads.get((code, "entry_level"), 0), n_ads.get((code, "experienced"), 0)
@@ -85,9 +111,15 @@ def main() -> None:
             "largely_unaffected": int(t["unaffected_frac"] >= 0.5) if t["unaffected_frac"] is not None else None,
             "gpt4_exposure": t["gpt4_exposure"], "gpt4_automation": t["gpt4_automation"],
         })
+    # %% Write CSV and Excel
+    # Sorted by occupation, then by how often entry-level ads require the task (most common first).
+    # utf-8-sig adds a BOM so Excel opens the CSV with the right encoding.
     df = pd.DataFrame(rows).sort_values(["osca_code", "pct_entry_required"], ascending=[True, False])
     stem = ROOT / "data" / f"task_prevalence_{args.tag}_{args.model}"
     df.to_csv(f"{stem}.csv", index=False, encoding="utf-8-sig")
+    # openpyxl touches for reading in Excel: freeze_panes "E2" keeps the header row and the first four
+    # columns (code, title, task_id, task) fixed while scrolling; auto_filter over ws.dimensions (the used
+    # range, e.g. "A1:V500") adds filter dropdowns; column B (title) and D (task text) are widened.
     with pd.ExcelWriter(f"{stem}.xlsx", engine="openpyxl") as xw:
         df.to_excel(xw, sheet_name="task_prevalence", index=False)
         ws = xw.sheets["task_prevalence"]

@@ -17,6 +17,9 @@ With --write, produces (tag = input tag + "_tasks"):
     data/occupation_meta_<tag>.csv                         one row per unit group: counts, entry share, sampled counts
 so merge_labels.py and match_tasks.py run on the new sample file unchanged.
 """
+# %% Imports
+# Standard library only. Sibling modules: `llm` for the model registry (used to build label file names)
+# and `label_osca.load_osca` for the OSCA code -> title map.
 from __future__ import annotations
 
 import argparse
@@ -27,16 +30,28 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+# Make the sibling modules importable when run as `python scripts/sample_for_tasks.py`.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from llm import DEFAULT_MODEL, MODELS  # noqa: E402
 from label_osca import DEFAULT_OSCA, load_osca  # noqa: E402
 
+# %% Directory layout and the two analysis levels
+# Inputs are found by tag in data/labels (osca_labels_*, seniority_labels_*) and outputs go to
+# data/samples, data/labels and data/ (occupation_meta CSV) under tag + "_tasks".
 ROOT = Path(__file__).resolve().parents[1]
 LABEL_DIR = ROOT / "data" / "labels"
 SAMPLE_DIR = ROOT / "data" / "samples"
+# label_seniority.py emits entry_level / experienced / unclear. Only the first two enter the analysis;
+# "unclear" ads are dropped here and count toward neither the cells nor the occupation totals.
 LEVELS = ("entry_level", "experienced")
 
 
+# %% Command line
+# input            a sample JSONL that has BOTH osca_labels_<tag>_<model>.jsonl and
+#                  seniority_labels_<tag>_<model>.jsonl (normally the "_selected" sample)
+# --per-cell       cap per (OSCA unit group, level) cell; seeded random draw (default 200)
+# --min-per-level  drop unit groups with fewer than this many ads at EITHER level (default 0 = keep all)
+# --write          write the sampled files; without it only the occupation_meta CSV and counts appear
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("input")
@@ -47,10 +62,16 @@ def main() -> None:
     ap.add_argument("--write", action="store_true")
     args = ap.parse_args()
 
+    # %% Tags and the OSCA code list
+    # out_tag appends "_tasks": "us_2026-09-17_selected" -> "us_2026-09-17_selected_tasks".
     tag = Path(args.input).stem.replace("sample_", "")
     out_tag = tag + "_tasks"
     groups = load_osca(Path(DEFAULT_OSCA))
 
+    # %% Load OSCA and seniority labels keyed by ad id
+    # OSCA: labelled, issue-free records with at least one candidate (same rule as the selection step,
+    # so on a "_selected" sample nothing should be lost here). Seniority: every labelled record; the
+    # level filter is applied when the cells are built.
     osca, sen = {}, {}
     for line in open(LABEL_DIR / f"osca_labels_{tag}_{args.model}.jsonl", encoding="utf-8"):
         r = json.loads(line)
@@ -61,6 +82,10 @@ def main() -> None:
         if "label" in r:
             sen[r["id"]] = r
 
+    # %% Build (unit group, level) cells from the UNCAPPED labelled set
+    # cells[(code, level)] = [ad ids]. An ad enters a cell only if its top-1 code is a known OSCA group,
+    # it has a seniority label, and that level is in LEVELS. The gold overrides from the review
+    # workbooks are NOT applied here (merge_labels.py applies them later); this stage uses model labels.
     cells: dict[tuple[str, str], list[str]] = defaultdict(list)
     for id_, r in osca.items():
         code = r["label"]["candidates"][0]["code"]
@@ -68,23 +93,39 @@ def main() -> None:
         if code in groups and s and s["label"]["level"] in LEVELS:
             cells[(code, s["label"]["level"])].append(id_)
 
+    # %% Occupation metadata from the full counts (before any capping)
+    # For each group with at least one cell: n_entry, n_experienced, entry_share = e / (e + x).
+    # These are carried onto every sampled ad as occ_n_entry / occ_n_experienced / occ_entry_share, so
+    # the raw entry share of the occupation survives even where a cell is capped at --per-cell.
+    # A group with ads at only one level gets 0 for the empty cell (defaultdict) and a share of 0 or 1.
+    # eligible: groups meeting --min-per-level at BOTH levels; others are excluded from sampling but
+    # still appear in the occupation_meta CSV with eligible = False.
     meta = {}
     for code in {c for c, _ in cells}:
         e, x = len(cells[(code, "entry_level")]), len(cells[(code, "experienced")])
         meta[code] = {"n_entry": e, "n_experienced": x, "entry_share": round(e / (e + x), 4) if e + x else None}
     eligible = {c for c, m in meta.items() if m["n_entry"] >= args.min_per_level and m["n_experienced"] >= args.min_per_level}
 
+    # %% Seeded per-cell sampling
+    # Cells are visited in sorted (code, level) order with ONE shared RNG, so the draw is reproducible
+    # for a given --seed and input but changes if any earlier cell's membership changes. A cell larger
+    # than --per-cell is trimmed to exactly --per-cell ads; smaller cells are kept whole. Capping both
+    # levels at the same size means the sampled entry share is ~50% for big groups; the true share is
+    # in meta. chosen[ad id] = code marks the ads to send on; sampled[code][level] = kept counts.
     rng = random.Random(args.seed)
     chosen: dict[str, str] = {}
     sampled = defaultdict(lambda: {"entry_level": 0, "experienced": 0})
     for (code, level), ids in sorted(cells.items()):
         if code not in eligible:
             continue
+        # random.sample = without replacement; `ids` is in OSCA label-file order
         keep = rng.sample(ids, args.per_cell) if len(ids) > args.per_cell else ids
         sampled[code][level] = len(keep)
         for i in keep:
             chosen[i] = code
 
+    # %% Console counts
+    # n_capped counts cells (not groups) that exceeded --per-cell and were trimmed.
     n_groups = len(sampled)
     n_capped = sum(1 for (c, l), ids in cells.items() if c in eligible and len(ids) > args.per_cell)
     print(f"unit groups: {len(meta)} labelled, {n_groups} eligible (min {args.min_per_level} per level) | "
@@ -92,6 +133,9 @@ def main() -> None:
     print(f"ads to send to task matching: {len(chosen):,} "
           f"(entry {sum(v['entry_level'] for v in sampled.values()):,}, experienced {sum(v['experienced'] for v in sampled.values()):,})")
 
+    # %% Write the occupation metadata CSV (always, even without --write)
+    # One row per labelled unit group, largest first: uncapped counts, entry share, sampled counts and
+    # whether it passed --min-per-level. This is the per-occupation table for the regression stage.
     meta_path = ROOT / "data" / f"occupation_meta_{out_tag}.csv"
     with open(meta_path, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
@@ -102,6 +146,11 @@ def main() -> None:
                         sampled[code]["entry_level"], sampled[code]["experienced"], code in eligible])
     print(f"wrote {meta_path}")
 
+    # %% Write the sampled ads and their label files (--write only)
+    # Re-reads the input so ads are emitted in input order. Each kept ad gains four fields
+    # (occ_osca_code, occ_n_entry, occ_n_experienced, occ_entry_share) before being written. The OSCA
+    # and seniority label files are written in the same order with the same ids under out_tag, so
+    # merge_labels.py and match_tasks.py run on the new sample with no extra arguments.
     if not args.write:
         return
     out_sample = SAMPLE_DIR / f"sample_{out_tag}.jsonl"

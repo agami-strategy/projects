@@ -18,6 +18,12 @@ Usage:
     python scripts/match_tasks.py data/samples/sample_aus_recent10.jsonl --limit 5
     python scripts/match_tasks.py data/samples/sample_aus_recent10.jsonl --min-per-level 5 --min-confidence 0.5
 """
+# %% Imports
+# pydantic models define the JSON shape the model must return. The sibling module `llm` wraps the API:
+#   complete_json(system, user, Schema, model_key, ...) -> (parsed Schema, usage dict, model id)
+#   Refusal        raised when the model returns nothing that validates against the schema
+#   cost(usage, model_key)  prices a usage dict; USAGE_KEYS are the token counters summed at the end
+# ThreadPoolExecutor runs several API calls at once; threading.Lock serialises the JSONL writes.
 from __future__ import annotations
 
 import argparse
@@ -34,15 +40,26 @@ from typing import Literal
 import openpyxl
 from pydantic import BaseModel, Field
 
+# Make the sibling module importable when run as `python scripts/match_tasks.py`.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from llm import DEFAULT_MODEL, MODELS, USAGE_KEYS, Refusal, complete_json, cost  # noqa: E402
 
+# %% Paths and constants
+# Reads merged_<tag>.csv from data/merged and the task table from data/osca_task_share.csv; writes
+# the three outputs to data/labels.
 ROOT = Path(__file__).resolve().parents[1]
 LABEL_DIR = ROOT / "data" / "labels"
 MERGED_DIR = ROOT / "data" / "merged"
 TASK_FILE = ROOT / "data" / "osca_task_share.csv"
+# Ad text sent to the model is cut at this many characters (~1,500 tokens). Long ads are mostly
+# boilerplate at the end; raising it costs more input tokens, lowering it risks cutting duty lists.
 MAX_AD_CHARS = 6000
 
+# %% System prompt (a string literal: leave the wording alone unless re-running a validation sample)
+# Defines the three-way judgement (explicit / implied / not_required), asks for a short quote as
+# evidence for explicit judgements only, and shows the exact JSON shape expected. The instruction to
+# ignore company descriptions, benefits and EEO boilerplate is what stops generic ads from matching
+# every task; "use implied sparingly" keeps the explicit-only and explicit+implied measures apart.
 SYSTEM_PROMPT = """You compare a job advertisement against the standard task list for its occupation and decide, \
 for every task, whether the advertised job calls for it.
 
@@ -61,6 +78,9 @@ Answer in JSON. Example of the shape (values illustrative):
 {"task_id": "8905", "judgement": "not_required", "evidence": ""}, {"task_id": "8912", "judgement": "implied", "evidence": ""}]}"""
 
 
+# %% Response schema
+# complete_json validates the model's JSON against Matches. A judgement outside the three literals
+# fails validation and surfaces as a Refusal in match_one(). evidence is required but may be "".
 class TaskJudgement(BaseModel):
     task_id: str
     judgement: Literal["explicit", "implied", "not_required"]
@@ -71,6 +91,16 @@ class Matches(BaseModel):
     judgements: list[TaskJudgement]
 
 
+# %% Task data: data/osca_task_share.csv
+# One row per (OSCA unit group, task). Columns used:
+#   OSCA_UNIT_CODE, Task ID, Task              the group, the task's id and its text
+#   TIME_SHARE                                 share of the occupation's time on this task; sums to 1
+#                                              within a group (this is the weight everywhere below)
+#   automation_time / augmentation_time /      TIME_SHARE split three ways, so they sum to TIME_SHARE
+#   unaffected_time
+#   gpt4_exposure, gpt4_automation             categorical labels carried through unchanged
+# Returns {code: [task dicts in file order]}. A group missing from this file cannot be matched and
+# its ads are skipped in main() ("no task data for OSCA code"). ai_dummy is not read here.
 def load_tasks() -> dict[str, list[dict]]:
     tasks: dict[str, list[dict]] = defaultdict(list)
     with open(TASK_FILE, encoding="utf-8-sig") as f:
@@ -84,11 +114,18 @@ def load_tasks() -> dict[str, list[dict]]:
     return tasks
 
 
+# %% Merged label table from merge_labels.py, keyed by ad id
+# Every value is a string (CSV). osca_confidence is "" for gold-coded ads, which matters for the
+# --min-confidence filter below.
 def load_merged(path: Path) -> dict[str, dict]:
     with open(path, encoding="utf-8-sig") as f:
         return {r["id"]: r for r in csv.DictReader(f)}
 
 
+# %% User message for one ad
+# Title, department, the (truncated) ad text, the occupation title and the task list as "id: text"
+# lines in CSV order. The model is asked for one judgement per task id. Ads with an empty
+# description_text still go through: the model then sees only the title and department.
 def ad_to_message(ad: dict, tasks: list[dict], osca_title: str) -> str:
     text = (ad.get("description_text") or "").strip()
     if len(text) > MAX_AD_CHARS:
@@ -102,6 +139,13 @@ def ad_to_message(ad: dict, tasks: list[dict], osca_title: str) -> str:
     )
 
 
+# %% One model call per ad
+# Returns either
+#   {"id", "judgements": {task_id: {"judgement", "evidence"}}, "missing_task_ids", "usage", "model"}
+# or {"id", "error"} when the model refused / returned nothing valid. missing_task_ids lists tasks the
+# model did not return a judgement for; summarise() scores them as "missing" (neither explicit nor
+# implied). Judgements for ids that are not in the task list stay in the dict but are ignored by
+# summarise(), which iterates over the task list. Duplicated task ids: last one wins.
 def match_one(ad: dict, tasks: list[dict], osca_title: str, model_key: str, thinking: bool) -> dict:
     # ~60 output tokens per task judgement; leave generous headroom for long task lists
     max_tokens = min(64000, 2000 + 80 * len(tasks))
@@ -115,10 +159,29 @@ def match_one(ad: dict, tasks: list[dict], osca_title: str, model_key: str, thin
     return {"id": ad["id"], "judgements": judgements, "missing_task_ids": missing, "usage": usage, "model": model_id}
 
 
+# %% Per-ad summary metrics
+# Inputs: the merged row, the group's task list and the raw result (None if the ad was never matched,
+# e.g. an error; then every task is "missing"). Outputs: one task row per (ad, task) for the `tasks`
+# sheet and one summary row for the `summary` sheet. Definitions:
+#   largely_automatable / augmentable / unaffected  = 1 if that component is >= 50% of the task's
+#       TIME_SHARE. A task can be "largely" two things only when one component is exactly 50%.
+#   time_share_explicit             sum of TIME_SHARE over tasks judged explicit
+#   time_share_explicit_or_implied  the same over explicit + implied
+#   automation_share_explicit       sum(automation_time over explicit) / time_share_explicit, i.e. the
+#       time-weighted automatable fraction of the tasks the ad calls for. Likewise for augmentation,
+#       and for the explicit_or_implied set. automation_share_occupation is the same ratio over ALL
+#       tasks of the group: the occupation baseline the ad is compared against (equal to
+#       sum(automation_time) when TIME_SHARE sums to 1).
+#   *_count_share                   unweighted: fraction of matched tasks that are largely X. The
+#       "_explicit" variants use explicit tasks only; the others use explicit + implied.
+# Ratios are None when the denominator is 0 (no tasks matched). Changing the 50% rule changes only
+# the count shares; the time-weighted shares do not depend on it. The entry-vs-experienced comparison
+# in the regression stage is on these per-ad shares, so this block is the core of the measurement.
 def summarise(ad_row: dict, tasks: list[dict], result: dict | None) -> tuple[list[list], list]:
     """Return (task rows, summary row) for one ad."""
     j = (result or {}).get("judgements", {})
     task_rows, acc = [], defaultdict(float)
+    # one pass over the group's tasks: emit a task row and accumulate per-judgement totals in `acc`
     for t in tasks:
         jj = j.get(t["task_id"], {"judgement": "missing", "evidence": ""})
         ts = t["time_share"]
@@ -131,6 +194,8 @@ def summarise(ad_row: dict, tasks: list[dict], result: dict | None) -> tuple[lis
                           ts, t["automation_time"], t["augmentation_time"], t["unaffected_time"],
                           t["gpt4_exposure"], t["gpt4_automation"],
                           largely["auto"], largely["aug"], largely["unaff"]])
+        # k is one of explicit / implied / not_required / missing; acc keys are "<measure>_<k>", e.g.
+        # acc["auto_explicit"] = automation time summed over explicit tasks (a SUMIF on judgement)
         k = jj["judgement"]
         acc[f"n_{k}"] += 1
         acc[f"time_{k}"] += ts
@@ -138,14 +203,17 @@ def summarise(ad_row: dict, tasks: list[dict], result: dict | None) -> tuple[lis
         acc[f"aug_{k}"] += t["augmentation_time"]
         for cat, flag in largely.items():
             acc[f"largely_{cat}_{k}"] += flag
+    # numerators / denominators for the time-weighted shares; "exim" = explicit or implied
     time_ex, time_exim = acc["time_explicit"], acc["time_explicit"] + acc["time_implied"]
     auto_ex, auto_exim = acc["auto_explicit"], acc["auto_explicit"] + acc["auto_implied"]
     aug_ex, aug_exim = acc["aug_explicit"], acc["aug_explicit"] + acc["aug_implied"]
+    # occupation baseline over all tasks (independent of the ad's judgements)
     occ_time = sum(t["time_share"] for t in tasks)
     occ_auto = sum(t["automation_time"] for t in tasks)
     occ_aug = sum(t["augmentation_time"] for t in tasks)
     n_ex = acc["n_explicit"]
     n_exim = acc["n_explicit"] + acc["n_implied"]
+    # fraction of matched tasks (explicit only, or explicit + implied) that are "largely" `cat`
     def count_share(cat: str, explicit_only: bool):
         n = n_ex if explicit_only else n_exim
         if not n:
@@ -171,6 +239,10 @@ def summarise(ad_row: dict, tasks: list[dict], result: dict | None) -> tuple[lis
     return task_rows, summary
 
 
+# %% Output column headers
+# TASK_HEADER matches the task_rows list order in summarise(); SUMMARY_HEADER matches the summary list
+# order. If a column is added in summarise() the header must change in the same position, as nothing
+# checks the two lengths agree.
 TASK_HEADER = ["ad_id", "ad_title", "level", "osca_code", "osca_title", "task_id", "task", "judgement", "evidence",
                "time_share", "automation_time", "augmentation_time", "unaffected_time", "gpt4_exposure", "gpt4_automation",
                "largely_automatable", "largely_augmentable", "largely_unaffected"]
@@ -184,6 +256,15 @@ SUMMARY_HEADER = ["ad_id", "ad_title", "company", "level", "level_source", "osca
                   "error"]
 
 
+# %% Command line
+# input             sample JSONL; its tag must match a merged_<tag>.csv written by merge_labels.py
+# --limit           first N ads only (for tests)   --workers  parallel API calls (default 4)
+# --thinking        DeepSeek thinking mode (slower, dearer; not used for the main run)
+# --dry-run         print the first message and a cost estimate, make no calls
+# --fresh           delete the previous match_labels JSONL instead of resuming from it
+# --min-per-level   match only groups with >= N entry_level AND >= N experienced ads
+# --min-confidence  skip ads whose model OSCA confidence is below this; gold-coded ads (blank
+#                   confidence) always pass. Both filters default to off (0 / 0.0).
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("input", help="JSONL of ads from sample_jobs.py")
@@ -199,6 +280,10 @@ def main() -> None:
     ap.add_argument("--min-confidence", type=float, default=0.0, help="skip ads whose OSCA top-1 confidence is below this")
     args = ap.parse_args()
 
+    # %% Resolve tags, load the merged table, task data and ads
+    # Output files carry the base tag AND the model key (tag = "<base_tag>_<model_key>"), so runs with
+    # different models sit side by side. --limit truncates the ad list only; the eligibility counts
+    # below still use the whole merged table.
     model_key = args.model
     base_tag = args.tag or Path(args.input).stem.replace("sample_", "")
     tag = base_tag + "_" + model_key
@@ -212,13 +297,23 @@ def main() -> None:
     if args.limit:
         ads = ads[: args.limit]
 
+    # %% Group eligibility (--min-per-level)
+    # Counts entry_level / experienced ads per OSCA code over the WHOLE merged table (not just --limit),
+    # applying the same confidence rule as the per-ad filter. A group is eligible when both levels meet
+    # the minimum. With the defaults every group that has any usable ad is eligible.
     level_counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     for row in merged.values():
         if row["osca_code"] and row["level"] in ("entry_level", "experienced"):
+            # blank confidence = gold (reviewer-assigned) code; it always counts
             if row["osca_confidence"] in ("", None) or float(row["osca_confidence"]) >= args.min_confidence:
                 level_counts[row["osca_code"]][row["level"]] += 1
     eligible = {c for c, d in level_counts.items() if d["entry_level"] >= args.min_per_level and d["experienced"] >= args.min_per_level}
 
+    # %% Per-ad filter
+    # Each ad is queued as (ad, merged row, task list) or skipped for the first failing reason: no OSCA
+    # code -> level not entry/experienced -> confidence below --min-confidence -> group not eligible ->
+    # no task data for the code. `skipped` tallies the reasons for the console line. Note "unclear"
+    # seniority ads are dropped here even if sample_for_tasks.py was not used upstream.
     work_items, skipped = [], defaultdict(int)
     for ad in ads:
         row = merged.get(ad["id"])
@@ -243,10 +338,15 @@ def main() -> None:
     if not work_items:
         sys.exit("nothing to do: every ad is missing an OSCA code, a seniority label or task data")
 
+    # %% Output paths (all under data/labels, named by tag + model)
     jsonl_path = LABEL_DIR / f"match_labels_{tag}.jsonl"
     xlsx_path = LABEL_DIR / f"match_tasks_{tag}.xlsx"
     csv_path = LABEL_DIR / f"match_summary_{tag}.csv"
 
+    # %% Dry run: show one message and estimate cost, then stop
+    # Rough token estimate: chars / 4 for input, ~30 tokens per task + 50 per ad for output. Prices are
+    # the MODELS registry's cache_miss input and output rates at peak list price; the actual run prints
+    # the real usage. No API call is made in this branch.
     if args.dry_run:
         ad, row, tasks = work_items[0]
         msg = ad_to_message(ad, tasks, row["osca_title"])
@@ -258,6 +358,12 @@ def main() -> None:
               f"(off-peak half; ~{est_in:,} input, ~{est_out:,} output tokens; tasks per ad max {max(len(t) for _, _, t in work_items)})")
         return
 
+    # %% Resume logic
+    # Previous results are re-read from match_labels_<tag>.jsonl. Only records with "judgements" count
+    # as done, so ads that errored last time are retried automatically; --fresh deletes the file first.
+    # New results are appended to the same file as they arrive, so a run can be interrupted and resumed
+    # without losing paid calls. Because errored ads are retried, the file can hold an error record and
+    # a later good record for the same id; the dict keeps the good one.
     results: dict[str, dict] = {}
     LABEL_DIR.mkdir(parents=True, exist_ok=True)
     if args.fresh and jsonl_path.exists():
@@ -271,6 +377,11 @@ def main() -> None:
         print(f"resuming: {len(results)} already matched")
     todo = [w for w in work_items if w[0]["id"] not in results]
 
+    # %% Parallel matching
+    # `work` wraps match_one so any exception becomes an error record instead of killing the pool.
+    # Results are written under a lock and flushed at once (that is what makes resume safe). The
+    # progress counter starts after the resumed count. Completion order is arbitrary, so the JSONL is
+    # NOT in input order; the final tables are rebuilt in input order below.
     lock = threading.Lock()
     out = open(jsonl_path, "a", encoding="utf-8")
     t0 = time.time()
@@ -301,11 +412,16 @@ def main() -> None:
             print(f"[{i}/{len(work_items)}] {ad['title'][:50]!r} [{row['osca_code']}] -> {shown}")
     out.close()
 
+    # %% Token usage and cost over every successful result (including resumed ones)
     ok = [r for r in results.values() if "judgements" in r]
     usage = {k: sum(r["usage"][k] for r in ok) for k in USAGE_KEYS}
     print(f"\nmatched {len(ok)}, errors {len(results) - len(ok)}, {time.time() - t0:.0f}s | tokens {usage} | "
           f"cost at peak rates ~${cost(usage, model_key):.2f} (off-peak half)")
 
+    # %% Build and write the task and summary tables
+    # Every queued ad gets a summary row, including errored / unmatched ones (all judgements "missing",
+    # error column filled), so the row count equals the usable ad count and gaps are visible. Rows are
+    # in work_items (input) order. The CSV duplicates the summary sheet for the regression scripts.
     task_rows, summary_rows = [], []
     for ad, row, tasks in work_items:
         tr, sr = summarise(row, tasks, results.get(ad["id"]))
