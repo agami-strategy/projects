@@ -1,0 +1,11 @@
+# all data files stay local: raw snapshots (hundreds of MB), ABS workbook, samples, labels
+# re-create with scripts/download_snapshot.py, scripts/sample_jobs.py, scripts/label_osca.py
+data/
+
+# local secrets
+.env
+
+.cache/
+__pycache__/
+*.pyc
+.venv/
